@@ -99,6 +99,11 @@ check("最早分流异常点在第1级",
       m["earliest_flow_imbalance"]["stage"] == 1
       and m["earliest_flow_imbalance"]["slowest"] == "C4",
       str(m["earliest_flow_imbalance"]))
+check("扁平树失衡分支定位到 root",
+      m["earliest_branch_imbalance"]["node_id"] == "root"
+      and m["earliest_branch_imbalance"]["stage"] == 1
+      and m["earliest_branch_imbalance"]["slowest_branch"] == "C4",
+      str(m["earliest_branch_imbalance"]))
 check("C4 判为连续扩大",
       m["deviation_assessment"]["C4"]["kind"] == "continuous_divergence",
       str(m["deviation_assessment"]["C4"]))
@@ -189,6 +194,115 @@ code, r = call("GET", "/batches/B003/report")
 check("孤立称量噪声",
       r["metrics"]["deviation_assessment"]["C3"]["kind"] == "isolated_noise",
       str(r["metrics"]["deviation_assessment"]["C3"]))
+
+# 8. 多层流道树：失衡须定位到分支节点 R 而非根
+multi_tree = {
+    "root": "sprue",
+    "nodes": [
+        {"node_id": "sprue", "children": ["L", "R"]},
+        {"node_id": "L", "feeds": ["C1", "C2"]},
+        {"node_id": "R", "children": ["R1", "R2"]},
+        {"node_id": "R1", "feeds": ["C3"]},
+        {"node_id": "R2", "feeds": ["C4"]},
+    ],
+}
+# 每级型腔增量合计 24 g + 流道料 6 g = 30 g；C3 快、C4 慢但两支均值相等，
+# 根节点两支平衡，失衡只发生在 R 节点内部。
+multi = [
+    stage(1, 10, 40, {"C1": 6, "C2": 6, "C3": 9, "C4": 3}, 6.0),
+    stage(2, 20, 80, {"C1": 12, "C2": 12, "C3": 15, "C4": 9}, 12.0),
+    stage(3, 30, 120, {"C1": 18, "C2": 18, "C3": 20, "C4": 16}, 18.0),
+    stage(4, 40, 160, {"C1": 24, "C2": 24, "C3": 25, "C4": 23}, 24.0),
+]
+code, r = call("POST", "/batches",
+               make_batch("B004", multi, runner_tree=multi_tree))
+check("多层树批次入库", code == 201, str(r)[:160])
+code, r = call("GET", "/batches/B004/report")
+bi = r["metrics"]["earliest_branch_imbalance"]
+check("失衡定位到分支节点 R",
+      bi["stage"] == 1 and bi["node_id"] == "R"
+      and bi["fastest_branch"] == "R1" and bi["slowest_branch"] == "R2"
+      and bi["cavities"] == ["C3", "C4"],
+      str(bi))
+check("分支明细带原始级次与型腔",
+      {b["branch"] for b in bi["branches"]} == {"R1", "R2"}
+      and bi["branches"][0]["mean_fill"] > 0,
+      str(bi["branches"]))
+
+# 9. 空树明确拒绝
+for label, empty in [("缺 runner_tree 字段", None),
+                     ("空对象", {}),
+                     ("feeds 为空", {"feeds": []}),
+                     ("nodes 为空", {"nodes": []})]:
+    bad = make_batch("E9", good_stages)
+    if empty is None:
+        del bad["runner_tree"]
+    else:
+        bad["runner_tree"] = empty
+    code, r = call("POST", "/batches", bad)
+    check("空树拒绝：%s" % label,
+          code == 400 and any(e["code"] == "EMPTY_RUNNER_TREE"
+                              for e in r["errors"]),
+          str(r.get("errors"))[:120])
+
+# 10. 树结构非法与接入核对
+bad = make_batch("E10", good_stages, runner_tree={
+    "nodes": [{"node_id": "a", "children": ["ghost"],
+               "feeds": ["C1", "C2", "C3", "C4"]}]})
+code, r = call("POST", "/batches", bad)
+check("悬空子节点", any(e["code"] == "RUNNER_TREE_INVALID"
+                        for e in r["errors"]), str(r["errors"])[:120])
+
+bad = make_batch("E11", good_stages, runner_tree={
+    "feeds": [{"cavity_id": c} for c in ("C1", "C2", "C3")]})
+code, r = call("POST", "/batches", bad)
+check("型腔未接入流道树",
+      any(e["code"] == "CAVITY_NOT_FED" and e["cavity"] == "C4"
+          for e in r["errors"]), str(r["errors"])[:120])
+
+bad = make_batch("E12", good_stages, runner_tree={
+    "nodes": [{"node_id": "root", "children": ["a", "b"]},
+              {"node_id": "a", "feeds": ["C1", "C2"]},
+              {"node_id": "b", "feeds": ["C1", "C3", "C4"]}]})
+code, r = call("POST", "/batches", bad)
+check("型腔重复进料",
+      any(e["code"] == "CAVITY_FED_TWICE" and e["cavity"] == "C1"
+          for e in r["errors"]), str(r["errors"])[:120])
+
+# 11. 报告快照可独立追溯：复算输入 + 采用记录 + 指标 + 人工处理
+code, r = call("GET", "/batches/B001/report")
+check("快照四要素齐全",
+      all(k in r for k in ("recompute_inputs", "adopted_records",
+                           "metrics", "manual_handling")))
+check("复算输入即原始提交",
+      r["recompute_inputs"]["batch_id"] == "B001"
+      and len(r["recompute_inputs"]["stages"]) == 4
+      and r["recompute_inputs"]["imbalance_limit"] == 0.05)
+check("采用记录含剔除与浇口方案",
+      r["adopted_records"]["exclusions"] == [{"stage": 3, "cavity_id": "C2"}]
+      and r["adopted_records"]["gate_plans"][0]["gate_changes"][0]
+      ["cavity_id"] == "C4",
+      str(r["adopted_records"]))
+check("人工处理带理由",
+      r["manual_handling"]["exclusions"][0]["reason"] == "称量时制件沾模未取净"
+      and r["manual_handling"]["follow_up_plans"][0]["note"] == "扩大 C4 浇口")
+
+# 12. 差异响应带两批次采用记录与完整快照
+code, r = call("GET", "/batches/B002/diff?other=B001")
+check("差异带两批采用记录",
+      r["adopted_records"]["B001"]["exclusions"]
+      == [{"stage": 3, "cavity_id": "C2"}]
+      and r["adopted_records"]["B001"]["gate_plans"]
+      and r["adopted_records"]["B002"]["exclusions"] == [],
+      str(r["adopted_records"]))
+check("差异带两批快照",
+      r["snapshots"]["B001"]["recompute_inputs"]["batch_id"] == "B001"
+      and r["snapshots"]["B002"]["metrics"]["fill_ratio"]
+      and r["snapshots"]["B001"]["manual_handling"]["exclusions"])
+check("差异带两批分支定位",
+      r["earliest_branch_imbalance"]["B001"]["node_id"] == "root"
+      and "B002" in r["earliest_branch_imbalance"],
+      str(r["earliest_branch_imbalance"]))
 
 print()
 if failures:

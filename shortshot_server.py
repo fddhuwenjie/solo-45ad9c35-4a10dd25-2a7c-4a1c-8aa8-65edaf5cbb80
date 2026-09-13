@@ -4,8 +4,10 @@
 
 接收多腔注塑短射试验数据：流道树、型腔容积、分级螺杆行程、压力曲线、
 逐腔重量、秤校验值与失衡限值；还原各级物料去向，核对物料账，输出每腔
-充填比例、进料滞后、级间增量、最早分流异常点，并区分连续扩大偏差与
-孤立称量噪声。支持人工剔除称量（须附理由）与登记浇口修整另起方案。
+充填比例、进料滞后、级间增量、最早分流异常点，并沿流道树定位最早发生
+失衡的分支节点；区分连续扩大偏差与孤立称量噪声。支持人工剔除称量
+（须附理由）与登记浇口修整另起方案。报告与批次差异均为可独立追溯的
+可复算 JSON：复算输入、实际采用的记录、计算指标与人工处理同快照返回。
 """
 
 import json
@@ -73,6 +75,111 @@ def _err(stage, cavity, code, message):
     return {"stage": stage, "cavity": cavity, "code": code, "message": message}
 
 
+def parse_runner_tree(tree):
+    """归一化流道树为节点列表 [{node_id, parent, children, feeds}]。
+
+    支持三种写法：
+      1. {"feeds": [{"cavity_id": ...}, ...]}        扁平，单根直接出各腔
+      2. {"root": "...", "nodes": [{node_id, children, feeds}, ...]}  邻接表
+      3. {"node_id": ..., "children": [{...}], "feeds": [...]}        嵌套
+    返回 (nodes, None)；空树或结构非法返回 (None, (code, message))。
+    """
+    if not isinstance(tree, dict) or not tree:
+        return None, ("EMPTY_RUNNER_TREE",
+                      "流道树为空：短射平衡必须提供流道拓扑")
+
+    def _norm_feeds(feeds):
+        out = []
+        for f in feeds or []:
+            out.append(f.get("cavity_id") if isinstance(f, dict) else f)
+        return [c for c in out if c]
+
+    nodes = []
+    if "nodes" in tree:
+        raw = tree.get("nodes") or []
+        if not raw:
+            return None, ("EMPTY_RUNNER_TREE", "流道树 nodes 为空")
+        by_id = {}
+        for n in raw:
+            nid = n.get("node_id")
+            if not nid:
+                return None, ("RUNNER_TREE_INVALID", "流道节点缺少 node_id")
+            if nid in by_id:
+                return None, ("RUNNER_TREE_INVALID",
+                              "流道节点重复：%s" % nid)
+            by_id[nid] = {"node_id": nid, "parent": None,
+                          "children": list(n.get("children") or []),
+                          "feeds": _norm_feeds(n.get("feeds"))}
+        for n in by_id.values():
+            for ch in n["children"]:
+                if ch not in by_id:
+                    return None, ("RUNNER_TREE_INVALID",
+                                  "节点 %s 指向不存在的子节点 %s"
+                                  % (n["node_id"], ch))
+                if by_id[ch]["parent"] is not None:
+                    return None, ("RUNNER_TREE_INVALID",
+                                  "节点 %s 有多个父节点" % ch)
+                by_id[ch]["parent"] = n["node_id"]
+        declared = tree.get("root")
+        roots = [nid for nid, n in by_id.items() if n["parent"] is None]
+        if declared:
+            if declared not in by_id:
+                return None, ("RUNNER_TREE_INVALID",
+                              "root 指向不存在的节点：%s" % declared)
+            root = declared
+        elif len(roots) == 1:
+            root = roots[0]
+        else:
+            return None, ("RUNNER_TREE_INVALID",
+                          "流道树不连通：存在 %d 个根" % len(roots))
+        seen, stack = set(), [root]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                return None, ("RUNNER_TREE_INVALID",
+                              "流道树存在环：%s" % cur)
+            seen.add(cur)
+            stack.extend(by_id[cur]["children"])
+        if len(seen) != len(by_id):
+            return None, ("RUNNER_TREE_INVALID", "流道树存在不可达节点")
+        nodes = list(by_id.values())
+    elif "node_id" in tree:
+        def _walk(obj, parent):
+            nid = obj.get("node_id")
+            if not nid:
+                return None
+            node = {"node_id": nid, "parent": parent,
+                    "children": [], "feeds": _norm_feeds(obj.get("feeds"))}
+            nodes.append(node)
+            for ch in obj.get("children") or []:
+                child = _walk(ch, nid)
+                if child is None:
+                    return None
+                node["children"].append(child)
+            return nid
+
+        if _walk(tree, None) is None:
+            return None, ("RUNNER_TREE_INVALID",
+                          "嵌套流道树存在缺 node_id 的节点")
+        ids = [n["node_id"] for n in nodes]
+        if len(set(ids)) != len(ids):
+            return None, ("RUNNER_TREE_INVALID", "流道节点重复")
+    elif "feeds" in tree:
+        feeds = _norm_feeds(tree.get("feeds"))
+        if not feeds:
+            return None, ("EMPTY_RUNNER_TREE",
+                          "流道树为空：feeds 未接任何型腔")
+        nodes = [{"node_id": "root", "parent": None,
+                  "children": [], "feeds": feeds}]
+    else:
+        return None, ("EMPTY_RUNNER_TREE",
+                      "流道树为空：未提供 nodes / node_id / feeds")
+
+    if not any(n["feeds"] for n in nodes):
+        return None, ("EMPTY_RUNNER_TREE", "流道树没有任何型腔出口")
+    return nodes, None
+
+
 def validate_batch(p):
     """返回错误列表；非空则拒绝入库。错误均点出原始级次与型腔。"""
     errors = []
@@ -94,13 +201,27 @@ def validate_batch(p):
     if not cavities:
         errors.append(_err(None, None, "NO_CAVITY", "未提供型腔容积表"))
 
-    # 流道树引用的型腔必须存在
-    runner = p.get("runner_tree") or {}
-    for leaf in runner.get("feeds", []):
-        cid = leaf.get("cavity_id")
-        if cid and cid not in seen:
-            errors.append(_err(None, cid, "UNKNOWN_CAVITY",
-                               "流道树指向未登记的型腔：%s" % cid))
+    # 流道树：空树明确拒绝；有效树须拓扑完整且每个型腔恰好接入一次
+    tree_nodes, tree_err = parse_runner_tree(p.get("runner_tree"))
+    if tree_err:
+        errors.append(_err(None, None, tree_err[0], tree_err[1]))
+    else:
+        feed_count = {}
+        for n in tree_nodes:
+            for cid in n["feeds"]:
+                if cid not in seen:
+                    errors.append(_err(None, cid, "UNKNOWN_CAVITY",
+                                       "流道树指向未登记的型腔：%s" % cid))
+                feed_count[cid] = feed_count.get(cid, 0) + 1
+        for cid in sorted(feed_count):
+            if feed_count[cid] > 1:
+                errors.append(_err(None, cid, "CAVITY_FED_TWICE",
+                                   "型腔被流道树重复进料：%s" % cid))
+        for c in cavities:
+            cid = c.get("cavity_id")
+            if cid not in feed_count:
+                errors.append(_err(None, cid, "CAVITY_NOT_FED",
+                                   "型腔未接入流道树：%s" % cid))
 
     # 级次与螺杆行程必须严格递增
     prev_no, prev_travel = None, None
@@ -193,6 +314,73 @@ def validate_batch(p):
 
 # ---------------------------------------------------------------- 分析引擎
 
+def branch_imbalance(tree_nodes, per_stage_fill, stage_axis, limit):
+    """沿流道树定位最早发生失衡的分支节点。
+
+    对每个分出 ≥2 支的节点（子节点或直接进料的型腔都算作一支），
+    逐级比较各支下游型腔的平均充填度；返回最早越限的级次、节点、
+    相关型腔与各支明细。同级多个节点越限时取最靠近根者。
+    """
+    by_id = {n["node_id"]: n for n in tree_nodes}
+
+    depth, frontier, d = {}, [n["node_id"] for n in tree_nodes
+                              if n["parent"] is None], 0
+    while frontier:
+        nxt = []
+        for nid in frontier:
+            depth[nid] = d
+            nxt.extend(by_id[nid]["children"])
+        frontier, d = nxt, d + 1
+
+    def subtree_cavities(nid):
+        node = by_id[nid]
+        cavs = list(node["feeds"])
+        for ch in node["children"]:
+            cavs.extend(subtree_cavities(ch))
+        return cavs
+
+    candidates = []
+    for n in tree_nodes:
+        branches = ([("node", c) for c in n["children"]] +
+                    [("cavity", c) for c in n["feeds"]])
+        if len(branches) >= 2:
+            candidates.append((n, branches))
+
+    for i, stage_no in enumerate(stage_axis):
+        row = per_stage_fill[i]
+        viol = []
+        for n, branches in candidates:
+            fills = []
+            for kind, bid in branches:
+                cavs = [bid] if kind == "cavity" else subtree_cavities(bid)
+                vals = [row[c] for c in cavs if c in row]
+                if vals:
+                    fills.append((bid, sum(vals) / len(vals), cavs))
+            if len(fills) < 2:
+                continue
+            spread = max(f[1] for f in fills) - min(f[1] for f in fills)
+            if spread > limit:
+                viol.append((depth.get(n["node_id"], 0), n["node_id"],
+                             n, fills, spread))
+        if viol:
+            viol.sort(key=lambda v: (v[0], v[1]))
+            _, _, node, fills, spread = viol[0]
+            fastest = max(fills, key=lambda f: f[1])
+            slowest = min(fills, key=lambda f: f[1])
+            return {
+                "stage": stage_no,
+                "node_id": node["node_id"],
+                "spread": round(spread, 4),
+                "fastest_branch": fastest[0],
+                "slowest_branch": slowest[0],
+                "cavities": sorted(set(fastest[2]) | set(slowest[2])),
+                "branches": [{"branch": b, "mean_fill": round(f, 4),
+                              "cavities": cavs}
+                             for b, f, cavs in fills],
+            }
+    return None
+
+
 def analyze(p, exclusions):
     """还原各级物料去向，输出充填比例、进料滞后、级间增量与异常判定。"""
     cavities = {c["cavity_id"]: c["volume"] for c in p["cavities"]}
@@ -260,6 +448,12 @@ def analyze(p, exclusions):
                        "fastest": worst[0], "slowest": worst[1]}
             break
 
+    # 沿流道树定位最早失衡的分支节点（空树/坏树在入库前已被拦截）
+    tree_nodes, _ = parse_runner_tree(p.get("runner_tree"))
+    branch = branch_imbalance(tree_nodes, per_stage_fill,
+                              [s["stage"] for s in stages], limit) \
+        if tree_nodes else None
+
     # 偏差性质：连续扩大 vs 孤立称量噪声
     deviation_type = {}
     n = len(stages)
@@ -304,6 +498,8 @@ def analyze(p, exclusions):
         "feed_lag_stages": feed_lag,
         "stage_increments_g": increments,
         "earliest_flow_imbalance": anomaly,
+        "earliest_branch_imbalance": branch,
+        "runner_node_count": len(tree_nodes or []),
         "deviation_assessment": deviation_type,
         "material_balance": material,
         "imbalance_limit": limit,
@@ -417,11 +613,14 @@ class App:
             return resp
         return self._json(start_response, 200, json.loads(row["payload"]))
 
-    def get_report(self, batch_id, environ, start_response):
-        row, resp = self._batch_or_404(batch_id, start_response)
-        if resp:
-            return resp
+    def _snapshot(self, batch_id):
+        """可复算批次快照：复算输入 + 实际采用的记录 + 计算指标 + 人工处理。"""
         conn = get_db()
+        row = conn.execute("SELECT * FROM batches WHERE batch_id=?",
+                           (batch_id,)).fetchone()
+        if not row:
+            conn.close()
+            return None
         excl = [dict(r) for r in conn.execute(
             "SELECT stage, cavity_id, reason, created_at FROM exclusions "
             "WHERE batch_id=? ORDER BY id", (batch_id,))]
@@ -434,15 +633,28 @@ class App:
 
         payload = json.loads(row["payload"])
         metrics = analyze(payload, excl)
-        return self._json(start_response, 200, {
+        return {
             "batch_id": batch_id,
             "created_at": row["created_at"],
-            "metrics": metrics,
-            "manual_handling": {
-                "exclusions": excl,          # 采用记录：被剔除的称量及理由
-                "follow_up_plans": plans,    # 浇口修整后另起的方案
+            "recompute_inputs": payload,         # 原始输入，可直接复算
+            "adopted_records": {                 # 本次计算实际采用的记录
+                "exclusions": [{"stage": e["stage"],
+                                "cavity_id": e["cavity_id"]} for e in excl],
+                "gate_plans": plans,
             },
-        })
+            "metrics": metrics,
+            "manual_handling": {                 # 人工处理流水（含理由与时间）
+                "exclusions": excl,
+                "follow_up_plans": plans,
+            },
+        }
+
+    def get_report(self, batch_id, environ, start_response):
+        snap = self._snapshot(batch_id)
+        if snap is None:
+            return self._json(start_response, 404,
+                              {"error": "批次不存在：%s" % batch_id})
+        return self._json(start_response, 200, snap)
 
     def add_exclusion(self, batch_id, environ, start_response):
         row, resp = self._batch_or_404(batch_id, start_response)
@@ -512,31 +724,41 @@ class App:
                            "gate_changes": changes})
 
     def diff(self, batch_id, environ, start_response):
-        """批次差异：?other=<batch_id>，对比两批次的末级充填与异常点。"""
+        """批次差异：?other=<batch_id>。
+
+        响应携带两批次的完整快照（复算输入、采用记录、指标、人工处理），
+        并单列两批次各自采用的称量剔除与浇口方案，便于独立追溯。
+        """
         from urllib.parse import parse_qs
         other = (parse_qs(environ.get("QUERY_STRING", ""))
                  .get("other", [None])[0])
         if not other:
             return self._json(start_response, 400,
                               {"error": "缺少查询参数 other=<batch_id>"})
-        rows = {}
+        snaps = {}
         for bid in (batch_id, other):
-            row, resp = self._batch_or_404(bid, start_response)
-            if resp:
-                return resp
-            rows[bid] = row
-        out = {"batches": [batch_id, other], "fill_ratio_delta": {},
-               "earliest_flow_imbalance": {}}
+            snap = self._snapshot(bid)
+            if snap is None:
+                return self._json(start_response, 404,
+                                  {"error": "批次不存在：%s" % bid})
+            snaps[bid] = snap
+
+        out = {
+            "batches": [batch_id, other],
+            "fill_ratio_delta": {},
+            "earliest_flow_imbalance": {},
+            "earliest_branch_imbalance": {},
+            "adopted_records": {},      # 两批次各自采用的剔除与浇口方案
+            "snapshots": snaps,         # 完整可复算快照
+        }
         fills = {}
-        for bid, row in rows.items():
-            conn = get_db()
-            excl = [dict(r) for r in conn.execute(
-                "SELECT stage, cavity_id, reason, created_at FROM exclusions"
-                " WHERE batch_id=?", (bid,))]
-            conn.close()
-            m = analyze(json.loads(row["payload"]), excl)
+        for bid, snap in snaps.items():
+            m = snap["metrics"]
             fills[bid] = m["fill_ratio"]
             out["earliest_flow_imbalance"][bid] = m["earliest_flow_imbalance"]
+            out["earliest_branch_imbalance"][bid] = \
+                m["earliest_branch_imbalance"]
+            out["adopted_records"][bid] = snap["adopted_records"]
         for cid in fills[batch_id]:
             if cid in fills[other]:
                 out["fill_ratio_delta"][cid] = round(
