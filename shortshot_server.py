@@ -40,7 +40,8 @@ DEFAULT_PRESSURE = {
     "attenuation_tolerance": 0.10,  # 同级兄弟支峰压相对衰减差限值
     "integral_tolerance": 0.10,   # 同级兄弟支注射区间积分相对差限值
     "clock_residual_s": 0.005,    # 采集器触发锚点逐帧抖动残差限值（秒）
-    "max_sample_gap_s": 0.050,    # 采样断档限值（相邻点时间间隔，秒）
+    "max_sample_gap_s": 0.050,    # 采样断档限值（相邻点时间间隔须不大于此，秒）
+    "sprue_delay_tolerance_s": 0.15,  # 机台→主流道根节点的传播延迟限值（秒）
 }
 
 
@@ -708,11 +709,18 @@ def _arrival_time(points, frac):
 
 
 def _window_integral(points, lo, hi):
-    """[lo, hi] 区间梯形积分；区间端点按分段线性插值补点。"""
-    inside = [p for p in points if lo <= p[0] <= hi]
-    if not inside:
+    """[lo, hi] 区间梯形积分；区间端点按分段线性插值补点。
+
+    窗口内无离散采样点但窗口落在曲线时标范围内时，仍用窗口两端的插值
+    点构成梯形积分（例如恒压 10.0 在 [0.0, 0.5] 上应得 5.0）；窗口完全
+    落在曲线时标范围之外才为 0。
+    """
+    if not points or hi <= lo:
         return 0.0
-    seg = [pt for pt in points if lo <= pt[0] <= hi]
+    t0, t1 = points[0][0], points[-1][0]
+    if hi <= t0 or lo >= t1:          # 与曲线定义域不相交
+        return 0.0
+    seg = [pt for pt in points if lo < pt[0] < hi]
     seg = [(lo, _interp(points, lo))] + seg + [(hi, _interp(points, hi))]
     # 去重并保持升序（lo/hi 恰有采样点时插值点与采样点重合）
     out = []
@@ -826,19 +834,18 @@ def pressure_review(payload, revisions, weight_metrics):
                          s.get("calibration_valid_until")))
 
     # ---- 锚点采纳：原始锚点 + 人工改锚点修订（注明理由、保留原值）
-    def adopted_anchor(sid, collector, stage_no):
-        row = anchors_raw.get(str(stage_no), anchors_raw.get(stage_no)) or {}
-        raw = row.get(collector)
+    # 锚点是采集器级时钟量：同一采集器挂多个传感器时，任一传感器的锚点
+    # 修订对该采集器的 alignment 与全部冻结曲线统一生效；同帧多次修订
+    # 时以最后一条（最新）为准。
+    def collector_rev(collector, stage_no):
         chosen = None
         for r in anchor_rev:
-            if r["sensor_id"] != sid:
-                continue
             if r["stage"] is not None and r["stage"] != stage_no:
                 continue
-            chosen = r
-        if chosen is not None:
-            return float(chosen["new_anchor"]), raw, chosen
-        return (float(raw) if raw is not None else None), raw, None
+            if (sensor_info[r["sensor_id"]].get("collector") or "default") \
+                    == collector:
+                chosen = r
+        return chosen
 
     # ---- 逐级对齐：机台曲线锚 0；各采集器锚点逐帧对齐
     collectors = sorted({s.get("collector") or "default" for s in sensors})
@@ -850,6 +857,7 @@ def pressure_review(payload, revisions, weight_metrics):
                            key=lambda c: (-use_count[c], c))[0]
 
     alignment = {}
+    adopted_anchors = {}   # (stage, collector) -> 采纳锚点（对齐与冻结共用）
     anchor_series = {c: [] for c in collectors}
     clock_block = False
     for s in stages:
@@ -866,15 +874,13 @@ def pressure_review(payload, revisions, weight_metrics):
                 clock_block = True
                 arow[c] = {"raw_anchor": None, "adopted_anchor": 0.0,
                            "revised_by": None}
+                adopted_anchors[(no, c)] = 0.0
                 continue
-            # 采集器锚点修订以该采集器上任一传感器的修订为准（同级一致）
-            rev = next((r for r in anchor_rev
-                        if (r["stage"] in (None, no))
-                        and (sensor_info[r["sensor_id"]].get("collector")
-                             or "default") == c), None)
+            rev = collector_rev(c, no)
             adopted = float(rev["new_anchor"]) if rev else float(raw)
             arow[c] = {"raw_anchor": float(raw), "adopted_anchor": adopted,
                        "revised_by": rev["sensor_id"] if rev else None}
+            adopted_anchors[(no, c)] = adopted
             anchor_series[c].append(adopted)
         alignment[no] = arow
 
@@ -884,7 +890,7 @@ def pressure_review(payload, revisions, weight_metrics):
         if len(series) >= 2:
             residual = max(series) - min(series)
             clock_residual[c] = round(residual, 6)
-            if residual > cfg["clock_residual_s"]:
+            if residual > cfg["clock_residual_s"] + 1e-9:
                 add_issue("CLOCK_RESIDUAL", c, "collector", None,
                           [round(min(series), 6), round(max(series), 6)],
                           "采集器 %s 触发锚点逐帧抖动 %.1f ms，超出 %.1f ms："
@@ -924,7 +930,7 @@ def pressure_review(payload, revisions, weight_metrics):
             kind, tid = sens["target_kind"], sens["target_id"]
             nid, nk = target_node(kind, tid)
             collector = sens.get("collector") or "default"
-            anchor, _, _ = adopted_anchor(sid, collector, no)
+            anchor = adopted_anchors.get((no, collector))
             max_p = sens["range"]["max_pressure"]
             frozen = {"collector": collector, "node": nid,
                       "target": [kind, tid],
@@ -970,7 +976,7 @@ def pressure_review(payload, revisions, weight_metrics):
 
             for i in range(1, len(adopted)):
                 gap = adopted[i][0] - adopted[i - 1][0]
-                if gap > cfg["max_sample_gap_s"]:
+                if gap > cfg["max_sample_gap_s"] + 1e-9:
                     add_issue("SAMPLE_GAP", nid, nk, no,
                               [adopted[i - 1][2], adopted[i][2]],
                               "第 %s 级传感器 %s（节点 %s）采样断档 %.1f ms，"
@@ -1178,7 +1184,7 @@ def pressure_review(payload, revisions, weight_metrics):
                 "delays_s": [{"stage": no, "delay_s": round(d, 6)}
                              for no, d in root_delays],
                 "median_delay_s": round(med, 6),
-                "restricted": med > cfg["delay_tolerance_s"],
+                "restricted": med > cfg["sprue_delay_tolerance_s"],
             }
 
     # ---- 证据路径上的数据质量问题：时钟问题全局一票否决；

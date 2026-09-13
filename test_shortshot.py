@@ -304,6 +304,156 @@ check("差异带两批分支定位",
       and "B002" in r["earliest_branch_imbalance"],
       str(r["earliest_branch_imbalance"]))
 
+# 13. _window_integral 窗口边界插值：窗口内无离散点也要积分
+check("窗口内无采样点按端点插值积分",
+      abs(srv._window_integral([[0.0, 10.0], [1.0, 10.0]], 0.0, 0.5) - 5.0)
+      < 1e-9)
+check("采样点全在窗口外但落在曲线定义域内仍积分",
+      abs(srv._window_integral([[0.2, 10.0], [0.4, 10.0]], 0.0, 0.5) - 5.0)
+      < 1e-9)
+check("窗口与曲线定义域不相交积分为 0",
+      srv._window_integral([[0.1, 10.0], [0.2, 10.0]], 0.4, 0.5) == 0.0)
+check("斜线跨窗积分等于梯形面积",
+      abs(srv._window_integral([[0.0, 0.0], [1.0, 10.0]], 0.0, 1.0) - 5.0)
+      < 1e-9)
+
+# 14. 同采集器多传感器：改任一传感器锚点须统一作用于 alignment 与全部冻结曲线
+pressure_tree = {
+    "root": "root",
+    "nodes": [
+        {"node_id": "root", "children": ["L", "R"]},
+        {"node_id": "L", "feeds": ["C1", "C2"]},
+        {"node_id": "R", "feeds": ["C3", "C4"]},
+    ],
+}
+pressure_sensors = [
+    {"sensor_id": "SROOT", "target_kind": "node", "target_id": "root",
+     "collector": "A", "range": {"max_pressure": 100.0},
+     "calibration_valid_until": "2030-01-01"},
+    {"sensor_id": "SL", "target_kind": "node", "target_id": "L",
+     "collector": "A", "range": {"max_pressure": 100.0},
+     "calibration_valid_until": "2030-01-01"},
+    {"sensor_id": "SR", "target_kind": "node", "target_id": "R",
+     "collector": "A", "range": {"max_pressure": 100.0},
+     "calibration_valid_until": "2030-01-01"},
+]
+# 采样间隔 ≤20 ms，避免采样断档；ROOT 0.20 到压、L 0.24、R 0.32（R 支滞后）
+p_machine = [[0.00, 20], [0.05, 30], [0.10, 55], [0.15, 48],
+             [0.20, 42], [0.25, 40], [0.30, 38]]
+p_root = [[10.00, 20], [10.05, 22], [10.10, 28], [10.15, 50],
+          [10.20, 60], [10.25, 50], [10.30, 42]]
+p_left = [[10.00, 20], [10.05, 21], [10.10, 24], [10.15, 40],
+          [10.20, 52], [10.24, 58], [10.30, 44]]
+p_right = [[10.00, 20], [10.05, 20], [10.10, 21], [10.15, 22],
+           [10.20, 24], [10.25, 30], [10.28, 38]]
+
+
+def pstage(no):
+    s = stage(no, no * 10, no * 40,
+              {"C1": no * 6, "C2": no * 6, "C3": no * 6, "C4": no * 2},
+              no * 9.0)        # 制件增量 20 g + 流道 9 g = 29 g ≈ 射出 30 g
+    s["pressure_curve"] = p_machine
+    s["mold_pressure"] = {"SROOT": p_root, "SL": p_left, "SR": p_right}
+    return s
+
+
+p_batch = make_batch("P001", [pstage(1), pstage(2), pstage(3)],
+                     runner_tree=pressure_tree)
+p_batch["sensors"] = pressure_sensors
+p_batch["trigger_anchors"] = {str(n): {"A": 10.0} for n in (1, 2, 3)}
+code, r = call("POST", "/batches", p_batch)
+check("压力批次入库", code == 201 and r.get("accepted"), str(r)[:200])
+code, r = call("GET", "/batches/P001/report")
+pr = r["metrics"]["pressure_review"]
+check("修订前对齐锚点为原始值",
+      pr["alignment"]["1"]["A"]["adopted_anchor"] == 10.0
+      and pr["alignment"]["1"]["A"]["revised_by"] is None,
+      str(pr["alignment"]["1"]))
+fz = pr["frozen_curves"]["sensors"]
+check("修订前三传感器冻结曲线均按 10.0 对齐（首点落在 0.0）",
+      all(fz[s]["1"]["aligned_points"][0][0] == 0.0 for s in
+          ("SROOT", "SL", "SR")),
+      str({s: fz[s]["1"]["aligned_points"][0] for s in
+           ("SROOT", "SL", "SR")}))
+check("修订前无质量问题且压力指认 R 支受限",
+      pr["status"] == "restricted"
+      and pr["restriction"]["primary"]["node_id"] == "root"
+      and pr["restriction"]["primary"]["slow_branch"] == "node:R"
+      and pr["restriction"]["cross_check"]["verdict"] == "agrees",
+      pr["status"])
+
+# 通过 SL 提交锚点修订 10.0 -> 9.9（采集器 A 级时钟量），覆盖全部级
+code, r = call("POST", "/batches/P001/pressure-revisions",
+               {"kind": "anchor_override", "sensor_id": "SL",
+                "new_anchor": 9.9,
+                "reason": "采集器 A 接线复核，触发时刻整体偏移 0.1 s"})
+check("锚点修订派生逐帧记录",
+      code == 201 and len(r["derived_records"]) == 3
+      and {x["stage"] for x in r["derived_records"]} == {1, 2, 3}
+      and all(x["old_anchor"] == 10.0 and x["new_anchor"] == 9.9
+              for x in r["derived_records"]), str(r))
+code, r = call("GET", "/batches/P001/report")
+pr = r["metrics"]["pressure_review"]
+check("修订后 alignment 统一为 9.9 且注明派生自 SL",
+      all(pr["alignment"][str(n)]["A"]["adopted_anchor"] == 9.9
+          and pr["alignment"][str(n)]["A"]["raw_anchor"] == 10.0
+          and pr["alignment"][str(n)]["A"]["revised_by"] == "SL"
+          for n in (1, 2, 3)),
+      str(pr["alignment"]))
+fz = pr["frozen_curves"]["sensors"]
+check("修订后 SROOT/SL/SR 冻结曲线统一平移（首点 0.1，锚点字段 9.9）",
+      all(fz[s]["1"]["adopted_anchor"] == 9.9
+          and abs(fz[s]["1"]["aligned_points"][0][0] - 0.1) < 1e-9
+          for s in ("SROOT", "SL", "SR")),
+      str({s: (fz[s]["1"]["adopted_anchor"],
+               fz[s]["1"]["aligned_points"][0])
+           for s in ("SROOT", "SL", "SR")}))
+# 关键回归：修复前 SROOT 仍按 10.0 对齐（首点 0.0），与 SL 的 0.1 不一致
+check("修订历史注明理由且原始记录未被覆盖",
+      len(pr["revision_history"]) == 3
+      and all(x["kind"] == "anchor_override"
+              and x["reason"].startswith("采集器 A")
+              and x["old_anchor"] == 10.0
+              for x in pr["revision_history"])
+      and r["recompute_inputs"]["trigger_anchors"]["1"]["A"] == 10.0,
+      str(pr["revision_history"]))
+
+# 锚点修订必须附理由；坏点排除必须给级次与时标区间
+code, r = call("POST", "/batches/P001/pressure-revisions",
+               {"kind": "anchor_override", "sensor_id": "SL",
+                "new_anchor": 9.8})
+check("无理由锚点修订被拒", code == 400, str(r))
+code, r = call("POST", "/batches/P001/pressure-revisions",
+               {"kind": "bad_point", "sensor_id": "SR",
+                "reason": "该帧受电磁干扰"})
+check("坏点缺级次/区间被拒", code == 400, str(r))
+
+# 15. 压力主流程：到压延迟、衰减、积分与批次差异中的压力字段
+code, r = call("GET", "/batches/P001/report")
+pr = r["metrics"]["pressure_review"]
+edges = {(e["to"], e["edge_kind"]): e for e in pr["edges"]}
+check("沿树父子边含传播延迟与衰减",
+      edges[("node:R", "runner")]["per_stage"][0]["delay_s"] > 0.05
+      and edges[("node:R", "runner")]["per_stage"][0]["peak_attenuation"]
+      is not None,
+      str(edges[("node:R", "runner")]["per_stage"][0]))
+check("注射区间积分非零（边界插值修复后）",
+      all(v["integral"] > 0 for sid in ("SROOT", "SL", "SR")
+          for st, v in pr["sensor_metrics"][sid].items())
+      and pr["frozen_curves"]["machine"]["1"]["points"])
+# 无传感器批次复核状态为 no_sensors，差异接口不受影响
+code, r = call("GET", "/batches/B002/diff?other=B001")
+check("差异接口对无传感器批次跳过压力字段",
+      code == 200 and r["pressure_review"] == {}, str(r.get("pressure_review")))
+# 有传感器批次入差异：冻结曲线/对齐/依据随快照共享
+code, r = call("GET", "/batches/P001/diff?other=B002")
+check("差异带压力复核与到压时刻",
+      code == 200 and r["pressure_review"]["P001"]["alignment"]["1"]["A"]
+      ["adopted_anchor"] == 9.9
+      and "SL" in r["pressure_arrival_delta"]
+      and r["pressure_review"]["P001"]["judgment_basis"]["rule"],
+      str(r.get("pressure_review", {}))[:160])
+
 print()
 if failures:
     print("失败：", failures)
