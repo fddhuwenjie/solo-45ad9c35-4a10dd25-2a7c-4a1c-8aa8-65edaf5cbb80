@@ -17,6 +17,20 @@
 与原始区间；压力证据与称重趋势相反时不给结论。人工改锚点、排除坏点
 须附理由并派生修订；报告、批次差异与复算 JSON 共用同一份冻结曲线、
 对齐参数与判断依据。
+
+同级多射次复核：短射序列逐级推进时料筒温度、模温与余料垫缓慢漂移，
+每级只打一模会把时间漂移误当成流道失衡。批次可为余料垫、熔体温度和
+模温设置允许窗口（process_windows），在同一级登记多次射次（shots：
+shot_id、顺序 seq、时刻、实际行程、过程参数、逐腔及流道重量），并可
+穿插重复的基准级（baseline_stage 或逐射次 baseline 标记）。分析先按
+秤校验与过程窗口筛除不可比射次，再用同级中位数和 MAD 计算逐腔重复
+性，依据穿插基准级（Theil-Sen 中位斜率）估计随射次顺序的漂移并校正，
+输出校正前后充填比例、95% 置信区间与稳定失衡分支（支间差异须越限且
+置信区间不重叠）。有效重复不足、过程参数越窗未处置、余料垫突变、基准
+级覆盖断档或校正后失衡方向改变时，定位射次与型腔并保持无结论。人工
+移除异常射次或注明理由继续采用，均另存修订（shot_revisions）；旧修订、
+批次差异与导出 JSON 均还原当时采用的射次、窗口与漂移校正参数。旧单
+射次载荷（stages）行为不变。
 """
 
 import json
@@ -42,6 +56,16 @@ DEFAULT_PRESSURE = {
     "clock_residual_s": 0.005,    # 采集器触发锚点逐帧抖动残差限值（秒）
     "max_sample_gap_s": 0.050,    # 采样断档限值（相邻点时间间隔须不大于此，秒）
     "sprue_delay_tolerance_s": 0.15,  # 机台→主流道根节点的传播延迟限值（秒）
+}
+
+# ---- 同级多射次复核 ----
+DEFAULT_SHOT_REVIEW = {
+    "min_repeats": 2,         # 每级有效射次下限（中位数/MAD 至少需要的重复数）
+    "outlier_mad_factor": 3.5,  # 同级离群判据（MAD 倍数，仅提示不阻断）
+    "min_mad_g": 0.02,        # MAD 下限（克），防零 MAD 时置信区间塌缩
+    "cushion_jump_mm": 1.0,   # 相邻有效射次余料垫突变限值
+    "baseline_max_gap": 5,    # 基准级覆盖最大间隔（射次序号）
+    "ci_z": 1.96,             # 置信区间半宽系数（95%）
 }
 
 
@@ -88,6 +112,14 @@ def init_db():
             collector  TEXT,                   -- anchor_override 时填采集器
             t_from     REAL, t_to REAL,        -- bad_point 的原始时标区间（秒）
             old_anchor REAL, new_anchor REAL,  -- anchor_override 锚点前后值
+            reason     TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS shot_revisions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id   TEXT NOT NULL REFERENCES batches(batch_id),
+            shot_id    TEXT NOT NULL,
+            action     TEXT NOT NULL,          -- exclude | keep
             reason     TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
